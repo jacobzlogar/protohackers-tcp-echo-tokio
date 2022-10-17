@@ -14,7 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// struct that represents client connection
-struct Client<'a> {
+struct Client {
     // client -> server
     client_tx: ClientTx,
     // server -> client
@@ -25,8 +25,8 @@ struct Client<'a> {
 
     buf: BytesMut,
 
-    recv_half: ReadHalf<'a>,
-    wr_half: WriteHalf<'a>,
+    recv_half: OwnedReadHalf,
+    wr_half: OwnedWriteHalf,
 }
 
 /// mpsc sender channel for clients to broadcast their messages to the server.
@@ -99,14 +99,14 @@ impl Connection {
     }
 }
 
-impl<'a> Client<'a> {
+impl Client {
     async fn create(
         address: SocketAddr,
-        mut stream: TcpStream,
+        stream: TcpStream,
         client_rx: ClientRx,
         client_tx: ClientTx,
-    ) -> Client<'a> {
-        let (mut recv_half, mut wr_half) = stream.split();
+    ) -> Client {
+        let (recv_half, wr_half) = stream.split();
         let client = Client {
             client_tx,
             client_rx,
@@ -132,25 +132,27 @@ impl<'a> Client<'a> {
         Ok(())
     }
 
-    async fn write(mut wr_half: OwnedWriteHalf, msg: String) -> io::Result<()> {
+    /// write messages received from the server to the client
+    async fn write(&mut self, msg: String) -> io::Result<()> {
         {
-            wr_half.write(&msg.into_bytes()).await?;
+            self.wr_half.write(&msg.into_bytes()).await?;
         }
         Ok(())
     }
 
-    async fn listen(&mut self) -> io::Result<String> {
-        while let Ok(msg) = self.wr_half.try_write(&self.buf) {
+    /// listen for messages on the client's write half
+    async fn listen(wr_half: OwnedWriteHalf, buf: BytesMut) -> io::Result<String> {
+        while let Ok(msg) = wr_half.try_write(&buf) {
             return Ok(msg.to_string());
         }
         panic!("disconnected")
-        //self.client_tx.send(dst.to_string());
     }
 
     /// listen for messages published from the server
-    async fn recv(&mut self, mut client_rx: ClientRx) -> io::Result<String> {
+    async fn recv(self, mut client_rx: ClientRx) -> io::Result<String> {
         while client_rx.changed().await.is_ok() {
-            let recv = self.client_rx.borrow().to_string();
+            let recv = client_rx.borrow().to_string();
+            drop(client_rx);
             return Ok(recv.to_string());
         }
         panic!("bad")
@@ -158,15 +160,15 @@ impl<'a> Client<'a> {
 
     /// spawn handles to process client read/writes
     async fn process(&mut self) -> io::Result<()> {
-        let client_rx = self.client_rx.clone();
-        let operation = self.recv(client_rx);
-        tokio::pin!(operation);
+        let op = Client::listen(self.wr_half, self.buf.clone());
+        tokio::pin!(op);
 
-        loop {
-            tokio::select! {
-                msg = &mut operation => { Client::write(self.wr_half, msg.unwrap()); },
-                Ok(wr_msg) = self.listen() => { println!("{:?}", wr_msg) },
-            }
+        let wr_half = self.wr_half.borrow();
+        std::mem::swap(&mut self.wr_half, wr_half.borrow_mut());
+        tokio::select! {
+            Ok(recv_msg) = self.recv(self.client_rx.clone()) => {
+                self.write(recv_msg).await.unwrap();
+            },
         }
 
         Ok(())
