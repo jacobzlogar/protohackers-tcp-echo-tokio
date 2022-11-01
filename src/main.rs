@@ -1,19 +1,22 @@
 use bytes::BytesMut;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::TryFutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
-use std::borrow::{Borrow, BorrowMut};
-use std::collections::HashMap;
+use std::borrow::{BorrowMut};
 use std::error::Error;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+
+#[derive(Debug)]
+struct Message {
+    user: String,
+    msg: String,
+}
 
 /// struct that represents client connection
+#[derive(Debug)]
 struct Client {
     // client -> server
     client_tx: ClientTx,
@@ -30,72 +33,81 @@ struct Client {
 }
 
 /// mpsc sender channel for clients to broadcast their messages to the server.
-type ClientTx = mpsc::UnboundedSender<String>;
+type ClientTx = mpsc::UnboundedSender<Message>;
 /// watch receiver channel for clients to receive new messages from the server.
 type ClientRx = watch::Receiver<String>;
 
 /// mpsc receiver channel for the server to receive messages from clients
-type ServerRx = mpsc::UnboundedReceiver<String>;
+type ServerRx = mpsc::UnboundedReceiver<Message>;
 /// watch sender channel for the server to broadcast new messages to clients.
 type ServerTx = watch::Sender<String>;
 
 type StateTx = mpsc::UnboundedSender<Connection>;
 type StateRx = mpsc::UnboundedReceiver<Connection>;
 
+type ConnectionTx = mpsc::UnboundedSender<Connection>;
+type ConnectionRx = mpsc::UnboundedReceiver<Connection>;
+
+#[derive(Debug)]
+struct Connection {
+    addr: SocketAddr,
+    name: String,
+}
+
+struct State {
+    state_rx: StateRx,
+    connection_tx: ConnectionTx,
+    connections: Vec<Connection>,
+}
+
+impl State {
+    fn create(state_rx: StateRx, connection_tx: ConnectionTx) -> Self {
+        Self {
+            state_rx,
+            connection_tx,
+            connections: vec![],
+        }
+    }
+    async fn handle_state(&mut self) -> io::Result<String> {
+        //TODO: handle joins and quits
+        println!("handling state");
+        while let Some(state) = self.state_rx.recv().await {
+            println!("user: {:?}", state);
+            self.connection_tx.send(state);
+        }
+        panic!("state handling failed");
+    }
+}
+
 struct Server {
     server_tx: ServerTx,
     server_rx: ServerRx,
-    state_rx: StateRx,
     client_rx: ClientRx,
-    connections: HashMap<SocketAddr, String>,
+    connection_rx: ConnectionRx,
 }
 
 impl Server {
     /// create a new Server instance to handle connections
     /// create watch channel to communicate with connected clients
-    fn create(server_rx: ServerRx, state_rx: StateRx) -> Self {
+    fn create(server_rx: ServerRx, connection_rx: ConnectionRx) -> Self {
         let (server_tx, client_rx) = watch::channel("client".to_string());
-        let connections = HashMap::new();
         Self {
             server_tx,
             server_rx,
-            state_rx,
             client_rx,
-            connections,
+            connection_rx,
         }
     }
 
-    async fn process(mut self) {
-        //TODO: handle joins and quits
-        while let Some(state) = self.state_rx.recv().await {
-            let user = state.name.trim();
-            println!("{:?}", state);
-            // update connection state, publish join message to connected clients
-            self.connections.insert(state.address, user.to_string());
-            let msg = Message {
-                msg: format!("{:?} joined \r\n", user),
-            };
-            self.server_tx.send(msg.msg);
-        }
+    async fn handle_messages(&mut self) -> io::Result<String> {
+        println!("handling messages");
         while let Some(server_msg) = self.server_rx.recv().await {
-            println!("server msg- {}", server_msg);
+            let msg = format!("{}: {}", server_msg.user.trim(), server_msg.msg);
+            dbg!(&msg);
+            self.server_tx.send(msg);
+            //return Ok(server_msg);
         }
-    }
-}
-#[derive(Debug)]
-struct Message {
-    msg: String,
-}
-
-#[derive(Debug)]
-struct Connection {
-    address: SocketAddr,
-    name: String,
-}
-
-impl Connection {
-    async fn create(address: SocketAddr, name: String) -> Self {
-        Self { address, name }
+        panic!("message handling failed")
     }
 }
 
@@ -106,7 +118,7 @@ impl Client {
         client_rx: ClientRx,
         client_tx: ClientTx,
     ) -> Client {
-        let (recv_half, wr_half) = stream.split();
+        let (recv_half, wr_half) = stream.into_split();
         let client = Client {
             client_tx,
             client_rx,
@@ -119,58 +131,66 @@ impl Client {
         return client;
     }
 
+    async fn listen(recv_half: &mut OwnedReadHalf, buf: &BytesMut) -> io::Result<String> {
+        while let Ok(_) = recv_half.readable().await {
+            let is_buf = &buf.is_empty();
+            println!("{:?}", &buf);
+            let wr_buf = &mut buf.to_vec();
+            recv_half.read_buf(wr_buf).await?;
+            let msg = String::from_utf8_lossy(wr_buf).to_string();
+            println!("{}", msg);
+            return Ok(msg);
+        }
+        panic!("disconnected")
+    }
+
     async fn join(&mut self, state_tx: StateTx) -> io::Result<()> {
         self.wr_half.write(b"Name?").await?;
         self.recv_half.read_buf(&mut self.buf).await?;
         let buf = &self.buf.to_vec();
+        self.buf.clear();
         let name = String::from_utf8_lossy(buf);
         self.name = Some(name.to_string());
-        let connection = Connection::create(self.address, name.to_string()).await;
+        let connection = Connection {
+            name: name.to_string(),
+            addr: self.address,
+        };
         state_tx.send(connection).unwrap_or_else(|e| {
-            panic!("{}", e);
+            println!("state error {}", e);
         });
         Ok(())
     }
 
     /// write messages received from the server to the client
-    async fn write(&mut self, msg: String) -> io::Result<()> {
-        {
-            self.wr_half.write(&msg.into_bytes()).await?;
-        }
+    async fn write_msg(wr_half: &mut OwnedWriteHalf, msg: String) -> io::Result<()> {
+        wr_half.borrow_mut().write(&msg.into_bytes()).await?;
         Ok(())
     }
 
-    /// listen for messages on the client's write half
-    async fn listen(wr_half: OwnedWriteHalf, buf: BytesMut) -> io::Result<String> {
-        while let Ok(msg) = wr_half.try_write(&buf) {
-            return Ok(msg.to_string());
-        }
-        panic!("disconnected")
-    }
-
     /// listen for messages published from the server
-    async fn recv(self, mut client_rx: ClientRx) -> io::Result<String> {
-        while client_rx.changed().await.is_ok() {
-            let recv = client_rx.borrow().to_string();
-            drop(client_rx);
-            return Ok(recv.to_string());
-        }
-        panic!("bad")
-    }
-
     /// spawn handles to process client read/writes
-    async fn process(&mut self) -> io::Result<()> {
-        let op = Client::listen(self.wr_half, self.buf.clone());
-        tokio::pin!(op);
-
-        let wr_half = self.wr_half.borrow();
-        std::mem::swap(&mut self.wr_half, wr_half.borrow_mut());
-        tokio::select! {
-            Ok(recv_msg) = self.recv(self.client_rx.clone()) => {
-                self.write(recv_msg).await.unwrap();
-            },
-        }
-
+    async fn process(mut self) -> io::Result<()> {
+        let listen_handle = tokio::spawn(async move {
+            while let Ok(recv) = Self::listen(self.recv_half.borrow_mut(), &self.buf).await {
+                let msg = Message {
+                    user: self.name.as_ref().unwrap().to_string(),
+                    msg: recv,
+                };
+                self.client_tx.send(msg).unwrap_or_else(|e| {
+                    println!("client error {}", e);
+                });
+                //drop(client_tx);
+            }
+        });
+        let write_handle = tokio::spawn(async move {
+            while let Ok(_) = self.client_rx.changed().await {
+                let msg = self.client_rx.borrow().to_string();
+                dbg!(&msg);
+                Self::write_msg(self.wr_half.borrow_mut(), msg).await;
+            }
+        });
+        write_handle.await?;
+        listen_handle.await?;
         Ok(())
     }
 }
@@ -182,16 +202,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 6969);
     let listener = TcpListener::bind(&addr).await.unwrap();
-
-    let (client_tx, server_rx) = mpsc::unbounded_channel::<String>();
     let (state_tx, state_rx) = mpsc::unbounded_channel::<Connection>();
+    let (connection_tx, connection_rx) = mpsc::unbounded_channel::<Connection>();
+    let mut state = State::create(state_rx, connection_tx.clone());
 
-    let server = Server::create(server_rx, state_rx);
+    tokio::spawn(async move {
+        println!("spawning state handle");
+        state.handle_state().await;
+    });
+
+    let (client_tx, server_rx) = mpsc::unbounded_channel::<Message>();
+
+    let mut server = Server::create(server_rx, connection_rx);
     let client_tx = client_tx.clone();
     let client_rx = server.client_rx.clone();
 
     tokio::spawn(async move {
-        server.process().await;
+        println!("spawning server handle");
+        server.handle_messages().await;
     });
 
     // spawn handle to accept connections
@@ -205,8 +233,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // spawn client handle
             let state_tx = state_tx.clone();
+            client.join(state_tx).await.unwrap();
             tokio::spawn(async move {
-                client.join(state_tx).await.unwrap();
                 client.process().await.unwrap();
             });
         }
